@@ -3,6 +3,12 @@ require("magrittr")
 require("dplyr")
 require("ggplot2")
 require("stringr")
+require("xgboost")
+require("tidymodels")
+require("recipes")
+require("doParallel")
+
+
 
 directory <- "C:/Users/Frank/OneDrive/Documents/git/MAST679_P1"
 
@@ -317,14 +323,157 @@ pass_data <- function(n, data = data, home = home, away = away){
 					"d_team_1", "d_opponent_1", "top_3_d_team_1", "top_3_d_opponent_1",
 					"d_team_delta", "top_3_d_opponent_delta")
 
-	return(out)
+	return(cbind(data_row, out))
 
 }
 
 
 
+#Build dataframe with passes
 pass_index <- data[Type == "PASS", which = TRUE]
 data_pass <- lapply(as.list(pass_index), function(n){pass_data(n, data = data, home = home, away = away)})
 names(data_pass) <- c(1:length(data_pass))
 
 data_pass <- data.table::copy(dplyr::bind_rows(Filter(Negate(is.null), data_pass)))
+
+#Distribution of the points according to the proposed metric
+pass_distribution <- data_pass[, lapply(.SD, function(x){
+
+							n <- sapply(x, function(x){if(x >= 0){0} else {abs(x)}})
+							values <- sort(unique(n))
+							max_val <- max(values)
+
+							out <- c(0:max_val)
+							for(i in 1:length(out)){
+
+								out[i] <- length(which(x == -out[i]))
+
+							}
+
+							return(out)
+
+
+					}), by = c("Team"), .SDcols = c("opponent_ahead_delta")] %>%
+					.[, Pass_score := lapply(.SD, function(x){c(0:(length(x) - 1))}), by = "Team", .SDcols = c("opponent_ahead_delta")]
+
+pass_distribution <- pass_distribution[, c("Team", "Pass_score", "opponent_ahead_delta"), with = FALSE]
+names(pass_distribution) <- c("Team", "Pass_score", "n")
+
+
+barcharts_pass_score <- list(
+
+	away = 	ggplot(data = pass_distribution[Team == "Away"], aes(x = Pass_score, y = n)) +
+			geom_bar(stat = "identity", fill = "steelblue") +
+			theme_minimal() +
+			xlab("Pass score") +
+			ylab("Number of passes") +
+			ggtitle("Away"),
+
+	home =  ggplot(data = pass_distribution[Team == "Home"], aes(x = Pass_score, y = n)) +
+			geom_bar(stat = "identity", fill = "steelblue") +
+			theme_minimal() +
+			xlab("Pass score") +
+			ylab("Number of passes") +
+			ggtitle("Home")
+
+)
+
+
+#Build the frame for xgboost
+subsequent_play_key <- data_pass$Key + 1
+outcome <- data[subsequent_play_key, c("Team", "Type", "Subtype")]
+
+columns <- c("distance_traveled",
+					"DfG_0", "DfG_1", "DfG_delta", "DfG_delta_p",
+					"angle_0", "angle_1", "ball_right_0", "ball_right_1",
+					"team_ahead_ball_0", "team_ahead_ball_1", "opponent_ahead_ball_0", "opponent_ahead_ball_1",
+					"team_ahead_delta", "opponent_ahead_delta",
+					"d_team_1", "d_opponent_1", "top_3_d_team_1", "top_3_d_opponent_1",
+					"d_team_delta", "top_3_d_opponent_delta", "Team")
+
+X <- data_pass[, columns, with = FALSE]
+names(X)[ncol(X)] <- "Team_0"
+
+names(outcome)[1] <- "Team_1"
+X <- cbind(X, outcome)
+
+#Possible outcomes
+possible_outcomes <- unique(X[, c("Type", "Subtype"), with = FALSE])
+possible_outcomes <- possible_outcomes[order(Type, Subtype)]
+
+#Is the subsequent play made by the same team?
+X[, Same_Team := (Team_0 == Team_1)]
+
+#Tag the outcomes
+X[Same_Team == TRUE & Type == "PASS", Next_Event := "PASS_FRIENDLY"] %>%
+.[Same_Team == FALSE & Type == "PASS", Next_Event := "PASS_ENEMY"] %>%
+.[Type == "BALL LOST", Next_Event := "BALL LOST"] %>%
+.[Type == "BALL OUT", Next_Event := "BALL OUT"] %>%
+.[Type == "CHALLENGE" & grepl("LOST", Subtype, TRUE), Next_Event := "CHALLENGE_LOST"] %>%
+.[Type == "CHALLENGE" & grepl("WON", Subtype, TRUE), Next_Event := "CHALLENGE_WON"] %>%
+.[Subtype == "INTERCEPTION", Next_Event := "INTERCEPTION"] %>%
+.[Type == "SHOT", Next_Event := "SHOT"] %>%
+.[, Next_Event := as.factor(Next_Event)]
+
+#Final frame
+X <- X[, c(columns[-length(columns)], "Next_Event"), with = FALSE]
+
+
+#Folds
+folds <- vfold_cv(X, v = 10)
+
+#Recipe
+rcp <- recipe(Next_Event ~ ., data = X) %>% prep()
+
+#Model
+xgb_model <- boost_tree(trees = tune(), learn_rate = tune(),
+					    tree_depth = tune(), min_n = tune(),
+                        loss_reduction = tune(), 
+                        sample_size = tune(), mtry = tune()) %>% 
+             set_mode("classification") %>% 
+             set_engine("xgboost", nthread = 16)
+
+#Parameters
+xgboost_params <- parameters(trees(), learn_rate(),
+                             tree_depth(), min_n(), 
+                             loss_reduction(),
+                             sample_size = sample_prop(), finalize(mtry(), X)) 
+
+xgboost_params <- xgboost_params %>% update(trees = trees(c(100, 150)))             
+
+#Workflow
+wflow <- workflow() %>%
+	     add_model(xgb_model) %>%
+	     add_recipe(rcp)
+
+#Train model
+doParallel::registerDoParallel(16)
+xgboost_model <- wflow %>%
+                 tune_bayes(resamples = folds,
+                            param_info = xgboost_params,
+                            initial = 10,
+                            iter = 50, 
+                            metrics = metric_set(mn_log_loss),
+                            control = control_bayes(no_improve = 10, verbose = TRUE, save_pred = TRUE))
+
+doParallel::stopImplicitCluster()
+
+
+best_params <- as.data.table(select_best(xgboost_model))
+out_of_fold_pred <- as.data.table(collect_predictions(xgboost_model))[.iter == as.integer(str_replace(best_params$.config, "Iter", ""))]
+
+pred_cols <- names(out_of_fold_pred)[which(grepl(".pred", names(out_of_fold_pred), TRUE))]
+
+mean_pred <- out_of_fold_pred[, lapply(.SD, mean), .SDcols = pred_cols]
+highest_prob <- apply(out_of_fold_pred[, pred_cols, with = FALSE], 1, which.max)
+
+s <- c(-1, -1, -2, 1, -2, 1, 5)
+scores <- apply(out_of_fold_pred[, pred_cols, with = FALSE], 1, function(x){sum(x * s)})
+scores <- as.data.table(scores)
+names(scores) <- "Score"
+
+ggplot(data = scores, aes(x = Score)) + 
+	geom_density(alpha = 0.5, fill = "blue") +
+	ylab("Density") +
+	ggtitle("Score Density plot")
+
